@@ -1,0 +1,620 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# Setting Up the Enivronment
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn import preprocessing
+import torch.utils.data as Data
+from sklearn import metrics
+import seaborn as sns
+import time
+from torch.nn.utils.rnn import pad_sequence, pack_sequence, pack_padded_sequence, pad_packed_sequence
+from torch.utils.data import Dataset, DataLoader
+
+
+# Whether GPU is available
+print('\nCUDA availability:  %s\n' % (torch.cuda.is_available()))
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+t1 = time.time()
+# Data Preprocess
+data1 = pd.read_csv(r'\\duhs-prot-nc1.dhe.duke.edu\dusom_dgim1\User_Projects\Pro00105834_Goldstein\AnalyticData\USRDS\usrdscohort_20210520.csv', nrows = 300000)
+# data1 = pd.read_csv('usrdscohort_20210520.csv', nrows = 100, index_col = 'USRDS patient ID')
+
+t2 = time.time()
+print("File Reading time: ", t2-t1)
+
+# Yes to 1, No to 0
+data1['Medicare Indicator (Y/N)'] = pd.Series(np.where(data1['Medicare Indicator (Y/N)'].values == 'Yes', 1, 0))
+data1['Medicare/Medicaid Dual Eligibility (Y/N)'] = pd.Series(np.where(data1['Medicare/Medicaid Dual Eligibility (Y/N)'].values == 'Yes', 1, 0))
+
+# 1 means Alive, 0 means Death
+# data1['Alive'] = pd.Series(np.where(data1['Date of Death'].isnull(), 1, 0))
+data1.insert(0,'Alive', pd.Series(np.where(data1['Date of Death'].isnull(), 1, 0))) 
+
+
+t3 = time.time()
+print("Yes to 1, No to 0: ", t3-t2)
+
+# OneHot encodes Treatment modality (training recoded)
+'''
+treatment = data1['Treatment modality (training recoded)']
+le = preprocessing.LabelEncoder()
+labels = le.fit_transform(treatment)
+labels.reshape(-1, 1)
+enc = preprocessing.OneHotEncoder()
+treatrment_onehot = enc.fit_transform(labels.reshape(-1, 1))  
+# save OneHot as a tuple in one column
+data1['treatment'] = tuple(treatrment_onehot.toarray())
+'''
+
+data1 = data1.join(pd.get_dummies(data1['Treatment modality (training recoded)']))
+data1 = data1.drop('Treatment modality (training recoded)', axis = 1).drop('IP_Encounters', axis = 1)
+data1.to_csv('data1.csv')
+t4 = time.time()
+print("data1 success")
+print("OneHot encoder: ", t4-t3)
+
+t5 = time.time()
+labels = []
+features = []
+for t in data1['USRDS patient ID'].unique():
+    labels.append((data1[data1['USRDS patient ID'] == t].iloc[0, 0]))
+    temp = torch.tensor(np.array(data1[data1['USRDS patient ID'] == t].iloc[:, 11:]))
+    # temp = np.array(data1[data1['USRDS patient ID'] == t].iloc[:, 11:])
+    # temp = data1[data1['USRDS patient ID'] == t].iloc[:, 11:].values.tolist()
+    features.append(temp)
+t6 = time.time()
+print("Features: ", t6-t5)
+
+features_padded = pad_sequence(features, batch_first = True).float()
+num_features = features[0].shape[1]
+
+'''
+class USRDS_Dataset(Dataset):
+    def __init__(self, labels, features):  
+        self.labels = labels
+        self.features = features
+        self.len = len(labels)
+    def __getitem__(self, index):
+        
+        label = torch.tensor(self.labels[index])
+        feature = self.features[index]
+        sample = {"label": label, "features": feature}
+        return sample
+    def __len__(self):
+        return self.len
+dataset = USRDS_Dataset(labels, features) # features
+t7 = time.time()
+print("Dataset: ", t7-t6)
+'''
+
+# Align to the right. Assuming everyone has last encounter.
+def count_numbers(num, df_series):
+    if num in df_series.value_counts():
+        return df_series.value_counts()[num]
+    else:
+        return 0
+
+    
+right_labels = []
+for i in range(0, len(labels)):
+    if labels[i] == 1:
+        temp = ([0] * len(features[i]))
+    
+    elif labels[i] == 0:
+        if len(features[i]) <= 12:
+            temp = [1] * len(features[i])
+        if len(features[i]) > 12:
+            temp = [1] * 12 
+            temp = temp + ([0] * (len(features[i]) - 12) )
+    right_labels.append(temp)
+
+
+max_encounter = features_padded[0].shape[0]
+df_num = pd.DataFrame(data = right_labels, columns = range(max_encounter, 0, -1)).fillna(-1)
+
+motality = []
+for i in range(max_encounter, 120, -1):
+    dead = count_numbers(1, df_num[i])
+    alive = count_numbers(0, df_num[i])
+    motality.append(dead/(alive + dead))
+pd.Series(motality, index = range(max_encounter, 120, -1)).plot(figsize = (14, 7))
+
+
+# Align to the left. Assuming everyone has first encounter.
+left_labels = []
+for i in range(0, len(labels)):
+    if labels[i] == 1:
+        temp = ([0] * len(features[i]))
+    
+    elif labels[i] == 0:
+        if len(features[i]) <= 12:
+            temp = [1] * len(features[i])
+        if len(features[i]) > 12:
+            temp = [1] * 12 
+            temp = ([0] * (len(features[i]) - 12) ) + temp
+    left_labels.append(temp)
+
+    
+max_encounter = features_padded[0].shape[0]
+df_num_left = pd.DataFrame(data = left_labels, columns = range(0, max_encounter)).fillna(-1)
+
+motality = []
+for i in range(0, max_encounter):
+    dead = count_numbers(1, df_num_left[i])
+    alive = count_numbers(0, df_num_left[i])
+    motality.append(dead/(alive + dead))
+
+pd.Series(motality, index = range(0, max_encounter)).plot(figsize = (14, 7))
+
+
+
+left_labels_tensor = []
+for item in left_labels:
+    left_labels_tensor.append(torch.tensor(item).float()) # Solve only Tensors of floating point dtype can require gradients
+left_labels_tensor 
+
+
+left_labels_tensor = pad_sequence(left_labels_tensor, batch_first = True, padding_value = -1)
+left_labels_tensor
+
+# Dataset
+
+class USRDS_Dataset(Dataset):
+    def __init__(self, labels, features, seq_len):  
+        self.labels = labels
+        self.features = features
+        self.len = len(labels)
+        self.seq_len = seq_len
+
+    def __getitem__(self, index):
+        
+        label = torch.tensor(self.labels[index])
+        feature = self.features[index]
+        # sample = {"label": label, "features": feature}   This is WRONG!
+        
+        return feature, label
+    def __len__(self):
+        return self.len
+
+def sequence_len(data, max_encounter):
+    seq_len = []
+    for i in range(len(data)):
+        seq_len.append(max_encounter - (data[i][1] == -1).sum())
+    data.seq_len = seq_len
+    # return seq_len
+
+'''
+def collate_fn(data):
+    # data.sort(key = lambda x: len(x), reverse = True)
+    data.size = len(data)
+    data.features = []
+    for i in range(data.size):
+        data.features.append(data[i]['features']) # list(trainset[0].keys())[1] = 'features'
+    
+    seq_len = [s.size(0) for s in data.features] # Get the true length of the data
+    # data.features = pad_sequence(data.features, batch_first = True)    
+    data.features = pack_sequence(data.features, enforce_sorted = False)
+    return data
+'''
+
+seq_len = [s.size(0) for s in features] # For masking
+dataset = USRDS_Dataset(left_labels_tensor, features_padded, seq_len)
+
+
+# Split dateset into training set and test set
+train_size = int(len(dataset) * 0.7)
+test_size = len(dataset) - train_size
+trainset, testset = torch.utils.data.random_split(dataset, [train_size, test_size], generator=torch.Generator().manual_seed(42))
+
+sequence_len(trainset, max_encounter)
+sequence_len(testset, max_encounter)
+
+# Hyperparameters
+batch_size = 16
+epochs = 10
+
+
+t7 = time.time()
+print("Dataset: ", t7-t6)
+
+# Load datasets
+# Add drop_last=True to solve Expected hidden[0] size (a, c, b), got [a, d, b]
+train_loader = torch.utils.data.DataLoader(dataset = trainset, batch_size = batch_size, shuffle = False) # shuffle has to be False
+test_loader = torch.utils.data.DataLoader(dataset = testset, batch_size = batch_size, shuffle = False) # shuffle has to be False
+
+t8 = time.time()
+print("create and load training and test sets: ", t8-t7)
+
+
+# Seq2Seq Model
+
+class Encoder(nn.Module):
+    # Need to reconsider batch_first = True
+    def __init__(self, input_dim, hidden_dim, layer_dim, batch_first = True):
+        super(Encoder, self).__init__()
+        self.batch_first = batch_first
+        self.hidden_dim = hidden_dim
+        self.layer_dim = layer_dim
+        # self.rnn = nn.RNN(input_dim, hidden_dim, layer_dim, batch_first = True, nonlinearity = 'relu')
+        # self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first = True)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim)
+        self.gru = nn.GRU(input_dim, hidden_dim, layer_dim)
+        
+    def forward(self, x_packed):
+        # h0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).requires_grad_().to(device)
+        # print(h0.shape)
+        # out, hn = self.lstm(x, h0.detach())
+        # out, hn = self.lstm(x, None) # Solve Expected hidden[0] size (2, 20, 4), got [20, 4]
+        
+        # total_length = x.size(1) if self.batch_first else x.size(0)
+        
+        # x_packed = pack_padded_sequence(x, seq_len, batch_first = self.batch_first, enforce_sorted = False)
+        
+        # output, hn = self.lstm(x_packed) # output, hn = self.lstm(x_packed, None)
+        packed_outputs, (hidden, cell) = self.lstm(x_packed)
+        # packed_outputs is a packed sequence containing all hidden states
+        # hidden is now from the final non-padded element in the batch
+        
+        # This is not necessary since we only need the hidden state hn
+        # Actually this line of code is absolutely WRONG!
+        encoder_outputs, _ = pad_packed_sequence(packed_outputs, batch_first = True, padding_value = -1)
+    
+        
+        return encoder_outputs, hidden, cell
+    
+class Decoder(nn.Module):
+    def __init__(self, output_dim, input_dim, hidden_dim, layer_dim, batch_first = True):
+        super(Decoder, self).__init__()
+        self.batch_first = batch_first
+        self.hidden_dim = hidden_dim
+        self.layer_dim = layer_dim   
+        self.output_dim = output_dim
+        
+        
+        self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim)
+        
+        # self.classifier = nn.Linear(hidden_dim, max_encounter) # output_dim here is max_encounter(for example, 183)
+        self.classifier = nn.Linear(hidden_dim, output_dim)
+   
+    def forward(self, x, hidden, cell):
+        packed_outputs, (hidden, cell) = self.lstm(x, (hidden, cell))
+        decoder_outputs, _ = pad_packed_sequence(packed_outputs, batch_first = True, padding_value = -1)
+        # output_padded, length = pad_packed_sequence(output, batch_first = self.batch_first, total_length = total_length)
+        # return output_padded, hidden
+        # print(decoder_outputs.shape)
+        # print(decoder_outputs)
+        prediction = self.classifier(decoder_outputs)
+        # prediction = [batch_size, output_dim]
+        return prediction, hidden, cell
+    
+        
+        '''
+        out, _ = pad_packed_sequence(output, batch_first = True, padding_value = -1)
+        
+        
+        print(out)
+        out = self.classifier(out[:, -1, :])
+        return out
+        '''
+
+class Seq2Seq(nn.Module):
+
+    def __init__(self, encoder, decoder, device):
+        super(Seq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
+        assert encoder.hidden_dim == decoder.hidden_dim, "Hidden dimensions of encoder and decoder must be equal!"
+        assert encoder.layer_dim == decoder.layer_dim, "layer dimensions of encoder and decoder must be equal!"
+
+    def forward(self, x):
+        encoder_outputs, hidden, cell = self.encoder(x)
+        # print("-------------------------------------encoder out-------------------------------------")
+        # print(encoder_outputs.shape)
+        # print("-------------------------------------encoder hidden--------------------------------------")
+        # print(encoder_outputs)
+       
+
+        # This last output of encoder is is used as the initial hidden state of the decoder.
+        # output_padded, hidden = self.decoder(x, hn)
+        prediction, hidden, _ = self.decoder(x, hidden, cell)
+        # print("-------------------------------------decoder out-------------------------------------")
+        # print(prediction.shape)
+        # print(prediction)
+        
+        # print("=============================================================================")
+        
+        return prediction
+
+
+# Model Initialization
+input_dim = num_features
+hidden_dim = 4
+layer_dim = 2
+# output_dim = num_features # Has to equal imput_dim
+output_dim = 1
+
+
+encoder = Encoder(input_dim, hidden_dim, layer_dim)
+decoder = Decoder(output_dim, input_dim, hidden_dim, layer_dim)
+
+model = Seq2Seq(encoder, decoder, device).to(device)
+
+# Parameters
+learning_rate = 0.001
+# criterion = nn.CrossEntropyLoss()
+criterion = nn.BCEWithLogitsLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr = learning_rate)
+
+length = len(list(model.parameters()))
+
+'''
+# Model Parameters
+for i in range(length):
+    print('parameter: %d' % (i+1))
+    print(list(model.parameters())[i].size()) 
+'''
+
+def init_weights(m):
+    for name, param in m.named_parameters():
+        nn.init.uniform_(param.data, -0.08, 0.08)      
+
+model.apply(init_weights)
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+print(f'The model has {count_parameters(model):,} trainable parameters')
+
+# Calculate the right number of labels, which will be used in loss = criterion(outputs, y)
+def num_multilabel(output, target):
+    
+    output_list = [] # The output which will be used in loss = criterion(outputs, y)
+    target_list = [] # The label which will be used in loss = criterion(outputs, y)
+    
+    '''
+    assert output.shape[0:2] == target.shape[0:2], \
+        "shapes output: {}, and target:{} are not aligned. ".\
+            format(output.shape, target.shape)
+    '''
+    # output.sigmoid_()
+    k = 0 # counter
+    for item in target:
+        
+        mask_num = (item == -1).sum().numpy() # We don't want to calculate target == -1
+        seq_len_num = max_encounter - mask_num
+        output_list.append(output[k][0: seq_len_num])
+        target_list.append(item[0: seq_len_num])
+        k = k + 1
+    
+    target_list = torch.cat(target_list, dim = 0) 
+    output_list = torch.cat(output_list, dim = 0)
+    
+    return output_list, target_list
+# Train
+xxx = [] # Debug
+yyy = [] # Debug
+xx = [] # Debug Input
+
+iter = 0
+for epoch in range(epochs):
+    for i, (x, y) in enumerate(train_loader):
+        # model.train()
+        xx = x
+        # print(x.shape)
+        # print(x)
+        x.requires_grad_().to(device)
+        
+        optimizer.zero_grad()
+        # y = y.long().to(device) # expected scalar type Long but found Float
+        y = y.to(device) # Solve result type Float can't be cast to the desired output type Long
+        # print(y.shape)
+        sequence_len(y, max_encounter)
+        x_packed = pack_padded_sequence(x, y.seq_len, batch_first = True, enforce_sorted = False)
+        
+        # print(y.seq_len)
+        outputs = model(x_packed) # sequence length should be the input
+        # outputs.squeeze(-1)
+        # print(outputs.shape)
+        # print(outputs)
+        
+        output_list, target_list = num_multilabel(outputs.squeeze(-1), y)
+    
+        loss = criterion(output_list, target_list)
+        loss.backward()
+        optimizer.step()
+        iter += 1   
+        if iter % 100 == 0: 
+            print('Iteration: {}, Loss: {:.5f}'.format(iter, loss.item()))
+        # xxx = outputs
+        yyy = y
+        # break
+    xxx.append(outputs)
+    # break
+    
+    # Test
+
+# Calculate the Accuracy
+def accuracy_multilabel(output, target):
+    assert output.shape == target.shape, \
+        "shapes output: {}, and target:{} are not aligned. ".\
+            format(output.shape, target.shape)
+    # output.sigmoid_()
+    mask_num = (Y_valid == -1).sum().numpy() # We don't want to calculate target == -1
+    output = output >= 0.5
+    # a = torch.round(output).eq(target).sum().cpu().numpy() 
+    a = output.eq(target).sum().cpu().numpy() 
+    b = (target.numel()- mask_num)
+    return a/b
+        
+    # return torch.round(output).eq(target).sum().cpu().numpy() -  mask_num / (target.numel()- mask_num)
+
+def test(dataloader, model, criterion):
+    test_loss = []
+    Y_valid = []
+    Y_pred = []
+    # Y_score = np.empty(shape = [0, 2])
+    
+    size = len(dataloader.dataset)
+    model.eval()
+    test_loss, correct = 0, 0
+    with torch.no_grad():
+        for x, y in dataloader:
+            # print(y)
+            # print(x.shape)
+
+            sequence_len(y, max_encounter)
+            x_packed = pack_padded_sequence(x, y.seq_len, batch_first = True, enforce_sorted = False)
+
+            y = y.to(device)
+            # print(y.shape)
+            outputs = model(x_packed)
+            # print(outputs)
+            
+            Y_valid.append(y)
+            Y_pred.append(outputs.sigmoid_()) # This is the logit
+            
+            # print(len(Y_pred))
+            # print(accuracy_multilabel(Y_valid, Y_pred))
+            
+            
+            '''
+            Y_valid = np.append(Y_valid, y.numpy())
+            Y_score = np.concatenate((Y_score, logits), axis = 0)
+            Y_pred = np.append(Y_pred, np.amax(outputs.numpy(), 1))
+            '''      
+            
+            test_loss += criterion(outputs.squeeze(-1), y).item()
+    
+    
+    # print(len(Y_pred))
+    Y_pred = torch.cat(Y_pred, dim = 0)
+    Y_pred = Y_pred.squeeze(-1) 
+    Y_valid = torch.cat(Y_valid, dim = 0) 
+    
+    
+    test_loss /= batch_size
+    # correct /= size
+    
+    # return Y_valid, Y_pred, Y_score
+    return Y_valid, Y_pred
+
+# Y_valid, Y_pred, Y_score = test(test_loader, model, criterion)
+Y_valid, Y_pred = test(test_loader, model, criterion)
+accuracy = accuracy_multilabel(Y_pred, Y_valid)
+# print(f"Test Error: \n Accuracy: {(100 * accuracy): > 0.1f}%, Avg loss: {test_loss:>8f} \n")
+print(f"Test Error: \n Accuracy: {(100 * accuracy): > 0.1f}% \n")
+
+# Save model
+torch.save(model.state_dict(), "model.pth")
+print("Saved PyTorch Model State to model.pth") 
+
+def Append_Y(seq_len, Y_valid, Y_score):
+    YY_valid = []
+    YY_score = []
+    for i in range(len(Y_valid)):
+        YY_valid.append(Y_valid[i][0: seq_len[i]])
+        YY_score.append(Y_score[i][0: seq_len[i]])
+    return torch.cat(YY_valid), torch.cat(YY_score)
+
+YY_valid, YY_score = Append_Y(testset.seq_len, Y_valid, Y_pred)
+
+# Plot ROC curve
+fpr, tpr, thresholds = metrics.roc_curve(YY_valid, YY_score) # , pos_label = 1 , drop_intermediate = False
+# print("fpr:{},tpr:{},thresholds:{}".format(fpr,tpr,thresholds))
+roc_auc = metrics.auc(fpr, tpr)
+print("AUC = ", roc_auc)
+plt.figure(3, figsize=(10,6))
+plt.plot(fpr, tpr)
+
+plt.xlim([0.00, 1.0])
+plt.ylim([0.00, 1.0])
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC")
+# plt.legend(loc="lower right")
+plt.savefig(r"./ROC.png")
+
+# Plot PR curve
+precision, recall, thresholds = metrics.precision_recall_curve(YY_valid, YY_score)
+pr = metrics.auc(recall, precision)
+print("AUPR = ", pr)
+plt.figure(2, figsize=(10,6))
+plt.plot(recall, precision)
+
+plt.xlim([0.00, 1.0])
+plt.ylim([0.00, 1.0])
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("PR")
+# plt.legend(loc="lower right")
+plt.savefig(r"./PR.png")
+
+
+
+
+
+# Per time point
+num_patients = Y_valid.shape[0]
+
+# Y_pred_array = (Y_pred >= 0.5).numpy() + 0
+Y_pred_array = Y_pred.numpy()
+Y_valid_array = Y_valid.numpy()
+df_pertime = pd.DataFrame(data = [motality], index = ["Motality"]).T
+df_pertime
+# df_pertime.to_excel("df_pertime1.xlsx")
+
+
+for i in range(0, max_encounter):
+    # print(i)
+    dfpertime = pd.DataFrame(data = [Y_pred_array[:, i], Y_valid_array[:, i]], index = ["Pred", "Valid"]).T
+    dfpertime = dfpertime[~(dfpertime['Valid'].isin([-1]))]
+    
+    # At least 2 encounters
+    if len(dfpertime) <= 1:
+        break
+    
+    fpr, tpr, thresholds = metrics.roc_curve(dfpertime["Valid"], dfpertime["Pred"]) 
+    roc_auc = metrics.auc(fpr, tpr)
+    # print("AUC = ", roc_auc)
+    precision, recall, thresholds = metrics.precision_recall_curve(dfpertime["Valid"], dfpertime["Pred"])
+    pr = metrics.auc(recall, precision)
+    df_pertime.loc[i, "AUROC"] = roc_auc
+    df_pertime.loc[i, "AUPR"] = pr
+    df_pertime.loc[i, "Proportion of Patients"] = sum(Y_valid_array[:, i] != -1) / num_patients
+    # print("AUPR = ", pr)
+
+df_pertime
+
+plt.figure(dpi = 500, figsize = (14, 7))
+df_pertime.plot(figsize = (14, 7))
+plt.savefig('pertime.png', dpi = 600, format = 'png')
+# df_pertime.to_excel("df_pertime2.xlsx")
+
+# There is a warning here because no data when i = 179
+# print(Y_pred_array[:, 179])
+# print(Y_valid_array[:, 179])
+
+# Boxplot
+
+dfp = pd.DataFrame([YY_valid.numpy(), YY_score.numpy()]).T
+dfp.columns = ['Y_valid', 'Y_pred']
+dfp1 = dfp[dfp['Y_valid'] == 1] # Alive
+print("Num of Alive Records: %d" % dfp1.shape[0])
+dfp2 = dfp[dfp['Y_valid'] == 0] # Dead
+print("Num of Dead Records: %d" % dfp2.shape[0])
+print("Total Encounters: %d" % (dfp1.shape[0] + dfp2.shape[0]))
+ddf = pd.DataFrame([dfp1['Y_pred'].values, dfp2['Y_pred'].values])
+ddf = ddf.T
+ddf.columns = ['Alive', 'Dead']
+plt.figure(figsize = (14, 7))
+sns.boxplot(data = ddf)
+plt.savefig('boxplot.png', dpi = 600, format = 'png')
